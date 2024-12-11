@@ -7,6 +7,8 @@ import csv
 from datetime import date
 import argparse
 from numpy.random import choice, shuffle
+import openai
+import numpy as np
 
 from tenacity import (
     retry,
@@ -23,6 +25,8 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
+from langchain_openai import OpenAIEmbeddings
+import networkx as nx
 
 #######################
 # Build argument parser
@@ -148,6 +152,7 @@ class Agent:
             llm=llm, memory=memory, prompt=chat_prompt, verbose=True
         )
         self.memory = agent_conversation
+        self.neighbors = []
 
     def receive_tweet(self, tweet, previous_interaction_type, tweet_written_count, add_to_memory):
         """Receive a tweet from another agent, and produce a response. The response contains the agent's updated opinion.
@@ -475,6 +480,9 @@ class Agent:
         """Outdate the persona memory. E.g., use past tense to describe the persona memory. Should "rewrite" the agent's memory."""
         self.persona = convert_text_from_present_to_past(self.persona)
 
+    def update_neighbors(self, neighbor):
+        self.neighbors.append(neighbor)
+
 
 def get_superscript(count):
     if count in [1, 21]:
@@ -489,7 +497,9 @@ def get_superscript(count):
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(50))
 def get_llm_response(conversation, prompt):
-    return conversation.predict(input=prompt)
+    result = conversation.predict(input=prompt)
+    print(result)
+    return result
 
 
 def get_integer_llm_response(conversation, prompt):
@@ -517,6 +527,13 @@ def get_integer_llm_response(conversation, prompt):
 
     return response
 
+def get_random_agent(list_agents):
+    size = len(list_agents)
+    index_list = list(range(size))
+
+    agent_idx_i = choice(index_list)
+    agent_i = list_agents[agent_idx_i]
+    return agent_i
 
 def get_random_pair(list_agents):
     """Get a random pair of agents from the list of agents.
@@ -641,10 +658,22 @@ def main(
     list_agents = []
     list_agent_ids = df_agents_selected["agent_id"]
     list_agent_persona = df_agents_selected["persona"]
+    # Create a graph
+    G = nx.Graph()
     for persona, agent_id in zip(list_agent_persona, list_agent_ids):
         agent = Agent(agent_id, persona, model_name, temperature, max_tokens, prompt_template_root)
         # And add them to the list of agents
         list_agents.append(agent)
+        G.add_node(agent)
+
+    # Add weighted edges based on similarity
+    sim_threshold = 0.6
+    for i, agent1 in enumerate(list_agents):
+        for j, agent2 in enumerate(list_agents):
+            if i < j:  # To avoid duplicate edges
+                sim = similarity(agent1, agent2)
+                if sim > sim_threshold:
+                    G.add_edge(agent1, agent2, weight=sim)
 
     dict_agent_tweet = defaultdict(list)
     dict_agent_response = defaultdict(list)
@@ -681,6 +710,7 @@ def main(
         + args.distribution
         + ".csv"
     )
+    os.makedirs(os.path.dirname(interaction_out_name), exist_ok=True)
     with open(interaction_out_name, "w+") as f:
         writer = csv.writer(f, delimiter=",")
         writer.writerow(
@@ -702,13 +732,13 @@ def main(
             row = []
             row.append(t + 1)
 
-            # Get a random pair of agents
-            agent_i, agent_j = get_random_pair(list_agents)
+            agent_j = get_random_agent(list_agents)
+
+            # Get a pair of agents
+            # agent_i, agent_j = get_random_pair(list_agents)
             row.append(agent_j.agent_name)
 
             # If the agent is no longer "fresh", outdate the memoery about their persona and the instruction
-            if agent_i.get_count_tweet_seen() + agent_i.get_count_tweet_written() == 1:
-                agent_i.outdate_persona_memory()
             if agent_j.get_count_tweet_seen() + agent_j.get_count_tweet_written() == 1:
                 agent_j.outdate_persona_memory()
 
@@ -736,43 +766,52 @@ def main(
                 current_interaction_type="write",
                 tweet_written_count=agent_j.get_count_tweet_written(),
             )
+            print(agent_j.persona)
+            for agent_i in G.neighbors(agent_j):
+                print(agent_i.persona)
 
-            row.append(agent_i.agent_name)
-            agent_i_pre_belief = agent_i.current_belief
-            row.append(agent_i_pre_belief)
 
-            agent_i_previos_interaction_type = agent_i.previous_interaction_type
-            if agent_i_previos_interaction_type in ["none", "write", "read"]:
-                response_i = agent_i.receive_tweet(
-                    tweet_j,
-                    previous_interaction_type=agent_i_previos_interaction_type,
-                    tweet_written_count=agent_i.get_count_tweet_written(),
-                    add_to_memory=False,
-                )
-                agent_i.increase_count_tweet_seen()
-                row.append(response_i)
-            else:
-                raise ValueError(
-                    "agent_i_previos_interaction_type is not valid: {}".format(
-                        agent_i_previos_interaction_type
+            for agent_i in G.neighbors(agent_j):
+                # If the agent is no longer "fresh", outdate the memoery about their persona and the instruction
+                if agent_i.get_count_tweet_seen() + agent_i.get_count_tweet_written() == 1:
+                    agent_i.outdate_persona_memory()
+
+                row.append(agent_i.agent_name)
+                agent_i_pre_belief = agent_i.current_belief
+                row.append(agent_i_pre_belief)
+
+                agent_i_previos_interaction_type = agent_i.previous_interaction_type
+                if agent_i_previos_interaction_type in ["none", "write", "read"]:
+                    response_i = agent_i.receive_tweet(
+                        tweet_j,
+                        previous_interaction_type=agent_i_previos_interaction_type,
+                        tweet_written_count=agent_i.get_count_tweet_written(),
+                        add_to_memory=False,
                     )
+                    agent_i.increase_count_tweet_seen()
+                    row.append(response_i)
+                else:
+                    raise ValueError(
+                        "agent_i_previos_interaction_type is not valid: {}".format(
+                            agent_i_previos_interaction_type
+                        )
+                    )
+
+                agent_i.add_to_memory(
+                    tweet_seen=tweet_j,
+                    response=response_i,
+                    previos_interaction_type=agent_i_previos_interaction_type,
+                    current_interaction_type="read",
+                    tweet_written_count=agent_i.get_count_tweet_written(),
                 )
 
-            agent_i.add_to_memory(
-                tweet_seen=tweet_j,
-                response=response_i,
-                previos_interaction_type=agent_i_previos_interaction_type,
-                current_interaction_type="read",
-                tweet_written_count=agent_i.get_count_tweet_written(),
-            )
+                agent_i.current_belief = extract_belief(response_i)
+                agent_i_post_belief = agent_i.current_belief
+                row.append(agent_i_post_belief)
+                row.append(agent_i_post_belief - agent_i_pre_belief)
+                writer.writerow(row)
 
-            agent_i.current_belief = extract_belief(response_i)
-            agent_i_post_belief = agent_i.current_belief
-            row.append(agent_i_post_belief)
-            row.append(agent_i_post_belief - agent_i_pre_belief)
-            writer.writerow(row)
-
-            agent_i.previous_interaction_type = "read"
+                agent_i.previous_interaction_type = "read"
             agent_j.previous_interaction_type = "write"
 
             for agent in list_agents:
@@ -809,6 +848,7 @@ def post_process_memory(list_agents, path_result, date_version):
             + args.distribution
             + ".txt",
         )
+        os.makedirs(os.path.dirname(out_name), exist_ok=True)
         with open(out_name, "w+") as f:
             f.write(agent.memory.prompt.messages[0].prompt.template)
             f.write("\n------------------------------\n")
@@ -817,6 +857,34 @@ def post_process_memory(list_agents, path_result, date_version):
                 f.write("\n------------------------------\n")
 
     return
+
+# Function to get embeddings
+def get_embedding(model="text-embedding-3-small"):
+    embeddings = OpenAIEmbeddings(
+        model=model,
+    # With the `text-embedding-3` class
+    # of models, you can specify the size
+    # of the embeddings you want returned.
+    # dimensions=1024
+    )
+    return embeddings
+
+def similarity(agent_1, agent_2):
+    # Get embeddings for each persona
+    embeddings = get_embedding()
+    persona1_embedding = embeddings.embed_query(agent_1.persona)
+    persona2_embedding = embeddings.embed_query(agent_2.persona)
+    # Convert embeddings to numpy arrays
+    persona1_vector = np.array(persona1_embedding)
+    persona2_vector = np.array(persona2_embedding)
+
+    # Compute cosine similarity
+    cosine_similarity = np.dot(persona1_vector, persona2_vector) / (
+        np.linalg.norm(persona1_vector) * np.linalg.norm(persona2_vector)
+    )
+    return cosine_similarity
+    
+
 
 
 def post_process_tweet(dict_agent_tweet, path_result, date_version):
